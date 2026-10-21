@@ -423,6 +423,23 @@ def main() -> int:
         f"「标记已读」不该挪动循环的下一次，实际 {mw_roll.next_fire_at}"
     results.append("弹窗两个按钮都重排「处理后计时」；固定模式与「标记已读」不动排期")
 
+    # 编辑框点「已处理」得把这条循环正开着的那张弹窗收掉。不关的话用户回头
+    # 再点一下那张弹窗的「知道了」，会又推一格（点两次推两次），见 spec §4。
+    closing = past_interval("链路测试-手动已处理关弹窗", interval_mode="rolling")
+    app.popups.show(closing)
+    app.root.update()
+    assert len(app.popups.open_popups) == 1, len(app.popups.open_popups)
+    doomed_win = app.popups.open_popups[0]
+
+    app.popups.close_for(closing)
+    app.root.update()
+    assert not doomed_win.winfo_exists(), "close_for 该把这张弹窗销毁掉"
+    assert app.popups.open_popups == [], \
+        f"close_for 该把它从 open_popups 摘掉，实际 {app.popups.open_popups}"
+
+    app.popups.close_for(closing)        # 幂等：重复调用不该抛
+    results.append("close_for 关掉指定便签的弹窗并摘出 open_popups（重复调用不抛）")
+
     # 上一张没处理时，到下一格要**再弹一张**（新弹窗会重新置顶一次），
     # 而且旧的那张被顶掉 —— 同一时刻只留一张，不叠一屏
     again = make_interval("链路测试-到点再弹", list(range(7)), LO, HI, 60, True,
@@ -670,12 +687,20 @@ def main() -> int:
 
     # 非法值必须提示，不能静默改成别的时间（只有格式问题才静默纠正）
 
-    def open_editor_with(prepare, title="新建提醒", reminder=None):
-        """开编辑框 → prepare 摆好输入 → 点保存 → 返回结果。
+    def open_editor_with(prepare, title="新建提醒", reminder=None, *,
+                         button="保存", before=None, after=None,
+                         editor_now=None):
+        """开编辑框 → prepare 摆好输入 → 点 button → 返回结果。
 
         两条命必须保住：窗口找不到时要重试（after 可能早于窗口建出来），
         以及无论如何都得关窗 —— wait_window() 只在窗口销毁后才返回，
         driver 里漏掉 destroy 会让整个测试文件永远挂住，之前就这么挂过一次。
+
+        button     —— 点哪个页脚按钮（"保存" / "已处理"）。
+        before     —— 点之前跑一次（测"基准时刻是点击那一刻"用）。
+        after      —— 点之后、销毁窗口之前跑一次（测对话框有没有自己关掉用）。
+        editor_now —— 传进 open_editor 的 now；不传就是 datetime.now()（既有行为）。
+                      传可调用对象可以测"打开框之后时钟还在走"。
         """
         box = {}
 
@@ -719,7 +744,13 @@ def main() -> int:
                         c.insert("1.0", "测试")
                         break
                 prepare(dlg, walk)
-                find_button(dlg, "保存").invoke()
+                app.root.update()
+                if before is not None:
+                    before()
+                    app.root.update()
+                find_button(dlg, button).invoke()
+                if after is not None:
+                    after(dlg)
                 # 保存被校验拦下（返回 None）是不少用例故意要的结果，
                 # 不是错误 —— 判定交给调用方，这里只管把窗口收干净
             except Exception as e:
@@ -731,8 +762,13 @@ def main() -> int:
 
         app.root.after(200, driver)
         fuse_id = app.root.after(8000, fuse)
-        value = edit_dialog.open_editor(app.main_window.win, reminder=reminder,
-                                        now=datetime.now())
+        value = edit_dialog.open_editor(
+            app.main_window.win, reminder=reminder,
+            now=editor_now if editor_now is not None else datetime.now(),
+            # 走 MainWindow._edit() 同一条接线 —— 不然 App 的收尾（关弹窗、
+            # 按「留记录」补记录）永远收不到回调。Task 5 之前 MainWindow
+            # 还没这个属性，取 None 不影响前面的任务。
+            on_handled=getattr(app.main_window, "on_handled", None))
         app.root.after_cancel(fuse_id)
         if "err" in box:
             raise box["err"]
@@ -896,6 +932,193 @@ def main() -> int:
         assert timedelta(minutes=25) < delta < timedelta(minutes=35), \
             f"改了间隔该按「现在 + 30 分」重排，实际 {keep.next_fire_at}（差 {delta}）"
         results.append("编辑保存：只改文案不重排，改间隔才按「现在 + 间隔」重排")
+
+        # 「保存」的基准时刻 = 点保存那一刻，不是打开框那一刻（2026-10-15 修）。
+        # 注入 datetime 会让 _now() 恒定、验不到这个差异，所以这里给 open_editor
+        # 传一个**可调用对象**当 now，由测试控制它什么时候往前走。
+        drift = make_interval("漂移对照", [0, 1, 2, 3, 4], LO, HI, 60, True,
+                              datetime.now(), interval_mode="rolling")
+        fake_t = {"now": datetime.now()}
+
+        def prep_drift(dlg, walk):
+            pick(dlg, walk, "循环")
+            set_entry(entries_of(dlg, walk)[6], "30")
+
+        def stall():
+            """打开框之后、点保存之前，把测试时钟往前拨 3 分钟。"""
+            fake_t["now"] = fake_t["now"] + timedelta(minutes=3)
+
+        assert open_editor_with(prep_drift, title="编辑提醒", reminder=drift,
+                                before=stall,
+                                editor_now=lambda: fake_t["now"]) is drift
+        delta = drift.next_fire_at - datetime.now()
+        assert timedelta(minutes=32) < delta < timedelta(minutes=34), \
+            f"重排基准该是「点保存那一刻 + 30 分」，实际 {drift.next_fire_at}" \
+            f"（差 {delta}）；差约 30 分说明基准是打开框那一刻（旧行为）"
+        results.append("编辑保存：重排基准是点保存那一刻，不是打开框那一刻")
+
+        # 「已处理」只在**编辑已有的「处理后计时」循环**时露脸（2026-10-15 spec §2）
+        #
+        # 不能用 collect_buttons 判在不在 —— 它递归 winfo_children()，而
+        # pack_forget 只是"不摆出来"，控件本身还是 btns 的子节点，照样被它数到。
+        # 判可见性得看 winfo_manager()（pack 好了才非空字符串）。
+        def managed_buttons(widget, out=None):
+            out = [] if out is None else out
+            for c in widget.winfo_children():
+                if isinstance(c, tk.Button) and c.winfo_manager():
+                    out.append(c)
+                managed_buttons(c, out)
+            return out
+
+        def buttons_seen(prepare, **kw):
+            """开一次编辑框，返回这一刻**摆出来的**按钮文案集合。"""
+            seen_btns = {}
+
+            def prep(dlg, walk):
+                prepare(dlg, walk)
+                seen_btns["set"] = set(b.cget("text")
+                                       for b in managed_buttons(dlg))
+
+            open_editor_with(prep, **kw)
+            return seen_btns["set"]
+
+        def prep_rolling_form(dlg, walk):
+            pick(dlg, walk, "循环", "处理后计时")
+
+        def prep_noop(dlg, walk):
+            pass
+
+        # 新建：就算表单选成「处理后计时」也不给 —— 新建本来就是"保存时刻 + 间隔"，
+        # 没有"已处理的上一格"可记
+        assert "已处理" not in buttons_seen(prep_rolling_form, title="新建提醒"), \
+            "新建时不该出现「已处理」"
+
+        fixed_src = make_interval("可见性-固定", list(range(7)), LO, HI, 60, True,
+                                  datetime.now())
+        assert fixed_src.interval_mode == "fixed", fixed_src.interval_mode
+        assert "已处理" not in buttons_seen(prep_noop, title="编辑提醒",
+                                            reminder=fixed_src), \
+            "固定时刻的循环不该出现「已处理」"
+
+        once_src = make_once("可见性-单次", datetime.now() + timedelta(hours=1))
+        assert "已处理" not in buttons_seen(prep_noop, title="编辑提醒",
+                                            reminder=once_src), \
+            "单次便签不该出现「已处理」"
+
+        roll_src = make_interval("可见性-滚动", list(range(7)), LO, HI, 60, True,
+                                 datetime.now(), interval_mode="rolling")
+        assert "已处理" in buttons_seen(prep_noop, title="编辑提醒",
+                                        reminder=roll_src), \
+            "编辑「处理后计时」的循环该出现「已处理」"
+
+        # 在框里把计时切回「固定时刻」，按钮要立刻消失
+        def prep_to_fixed(dlg, walk):
+            pick(dlg, walk, "循环", "固定时刻")
+
+        fixed2 = make_interval("可见性-切走", list(range(7)), LO, HI, 60, True,
+                               datetime.now(), interval_mode="rolling")
+        assert "已处理" not in buttons_seen(prep_to_fixed, title="编辑提醒",
+                                            reminder=fixed2), \
+            "切回「固定时刻」后「已处理」该消失"
+        results.append("「已处理」只在编辑已有的「处理后计时」循环时出现")
+
+        # 点它：对话框自己关掉、排期从点击那一刻重新起算、snooze 被清
+        manual = make_interval("可见性-点它", list(range(7)), LO, HI, 60, True,
+                               datetime.now(), interval_mode="rolling")
+        manual.next_fire_at = datetime.now() + timedelta(minutes=17)
+        manual.snooze_until = datetime.now() + timedelta(minutes=5)
+        kept_next = manual.next_fire_at
+        closed = {}
+
+        def note_closed(dlg):
+            app.root.update()
+            closed["exists"] = bool(dlg.winfo_exists())
+
+        assert open_editor_with(prep_noop, title="编辑提醒", reminder=manual,
+                                button="已处理", after=note_closed) is manual
+        assert closed.get("exists") is False, "点「已处理」该把对话框也关掉"
+        assert manual.next_fire_at > kept_next, \
+            f"该从此刻重新起算（原格 {kept_next}），实际 {manual.next_fire_at}"
+        delta = manual.next_fire_at - datetime.now()
+        assert timedelta(minutes=59) < delta < timedelta(minutes=61), \
+            f"该落在「点击时刻 + 60 分」，实际 {manual.next_fire_at}（差 {delta}）"
+        assert manual.snooze_until is None, manual.snooze_until
+        results.append("点「已处理」：关窗 + 从此刻重新起算 + 清 snooze")
+
+        # 校验没过时点它：弹提示、**不动排期**、对话框不关（跟「保存」一样）
+        guard = make_interval("可见性-校验", list(range(7)), LO, HI, 60, True,
+                              datetime.now(), interval_mode="rolling")
+        guard.next_fire_at = datetime.now() + timedelta(minutes=17)
+        want_guard = guard.next_fire_at
+        guard_closed = {}
+
+        def prep_bad_step(dlg, walk):
+            pick(dlg, walk, "循环", "处理后计时")
+            set_entry(entries_of(dlg, walk)[6], "-5")
+
+        def note_guard_closed(dlg):
+            app.root.update()
+            guard_closed["exists"] = bool(dlg.winfo_exists())
+
+        warnings.clear()
+        assert open_editor_with(prep_bad_step, title="编辑提醒", reminder=guard,
+                                button="已处理",
+                                after=note_guard_closed) is None
+        assert warnings and "间隔" in warnings[-1], warnings
+        assert guard.next_fire_at == want_guard, \
+            f"校验没过就不该动排期，实际 {guard.next_fire_at}"
+        assert guard_closed.get("exists") is True, \
+            "校验没过时对话框该留着（跟「保存」一致）"
+        results.append("校验没过时「已处理」被拦下：不动排期、对话框不关")
+
+        # 端到端：App 收尾 —— 关掉那张弹窗、（勾了「留记录」才）补一条同 parent_id
+        # 的已完成记录、落盘刷新
+        live = make_interval("端到端-留记录开", list(range(7)), LO, HI, 60, True,
+                             datetime.now(), interval_mode="rolling",
+                             log_to_list=True)
+        live.next_fire_at = datetime.now() + timedelta(minutes=17)
+        app.main_window.items.append(live)
+        app.main_window.refresh()
+        app.popups.show(live)
+        app.root.update()
+        assert len(app.popups.open_popups) == 1, len(app.popups.open_popups)
+        live_win = app.popups.open_popups[0]
+        before_count = len(app.main_window.items)
+
+        assert open_editor_with(prep_noop, title="编辑提醒", reminder=live,
+                                button="已处理") is live
+        app.root.update()
+
+        assert not live_win.winfo_exists(), "点「已处理」该把这条循环的弹窗收掉"
+        assert app.popups.open_popups == [], app.popups.open_popups
+        logs = [i for i in app.main_window.items if i.parent_id == live.id]
+        assert len(logs) == 1, f"该补一条记录，实际 {len(logs)} 条"
+        assert len(app.main_window.items) == before_count + 1, \
+            f"只该多一条，实际多了 {len(app.main_window.items) - before_count} 条"
+        entry = logs[0]
+        assert entry.text == live.text, entry.text
+        assert entry.kind == "once" and entry.done is True, (entry.kind, entry.done)
+        assert entry.next_fire_at > datetime.now() - timedelta(minutes=1), \
+            "记录条目的时刻该是刚才那次处理"
+
+        # 反向：没勾「留记录」就一条都不补（只有排期和弹窗动）
+        quiet = make_interval("端到端-留记录关", list(range(7)), LO, HI, 60, True,
+                              datetime.now(), interval_mode="rolling",
+                              log_to_list=False)
+        quiet.next_fire_at = datetime.now() + timedelta(minutes=17)
+        app.main_window.items.append(quiet)
+        app.main_window.refresh()
+        kept_quiet = quiet.next_fire_at
+
+        assert open_editor_with(prep_noop, title="编辑提醒", reminder=quiet,
+                                button="已处理") is quiet
+        app.root.update()
+
+        assert [i for i in app.main_window.items if i.parent_id == quiet.id] == [], \
+            "没勾「留记录」不该补记录条目"
+        assert quiet.next_fire_at > kept_quiet, \
+            "没勾「留记录」也照样要从此刻重新起算"
+        results.append("点「已处理」端到端：关弹窗 + 勾了「留记录」才补一条同形记录")
 
 
         # 反向：可纠正的格式问题仍应静默处理，不能一起被拦下

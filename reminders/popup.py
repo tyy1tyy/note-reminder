@@ -51,6 +51,9 @@ class PopupManager:
         self.root = root
         self.on_changed = on_changed
         self.open_popups: list[tk.Toplevel] = []
+        # reminder.id -> 那张弹窗。open_popups 只有窗口、认不出是哪条便签，
+        # 编辑框的「已处理」要按便签关单张，所以另挂一张表。
+        self._windows: dict[str, tk.Toplevel] = {}
 
     def close_all(self) -> None:
         """关掉当前所有弹窗。
@@ -62,6 +65,22 @@ class PopupManager:
             if w.winfo_exists():
                 w.destroy()
         self.open_popups.clear()
+        self._windows.clear()
+
+    def close_for(self, reminder) -> None:
+        """关掉某条便签当前开着的那张弹窗（编辑框「已处理」用）。
+
+        直接 destroy，**不走 dismiss()** —— 会触发排期副作用的只有弹窗上那三个
+        按钮，这里跟"被新弹窗顶掉"（close_all 的 destroy）同性质，不该替用户
+        留下任何"已处理"。
+        """
+        win = self._windows.pop(reminder.id, None)
+        if win is None:
+            return
+        if win in self.open_popups:
+            self.open_popups.remove(win)
+        if win.winfo_exists():
+            win.destroy()
 
     @staticmethod
     def _release_topmost_later(win: tk.Toplevel) -> None:
@@ -119,6 +138,7 @@ class PopupManager:
         win.attributes("-topmost", True)    # 弹出瞬间抬到最前，保证不会被漏看
         self._release_topmost_later(win)    # 只是这一瞬置顶，不恒置顶
         self.open_popups.append(win)
+        self._windows[reminder.id] = win
 
         def dismiss() -> None:
             """只把这张纸收掉 —— 不带任何排期副作用。
@@ -129,6 +149,7 @@ class PopupManager:
             """
             if win in self.open_popups:
                 self.open_popups.remove(win)
+            self._windows.pop(reminder.id, None)   # 跟 open_popups 同增同减
             win.destroy()
 
         def on_close() -> None:

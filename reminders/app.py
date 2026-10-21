@@ -9,7 +9,7 @@ from tkinter import messagebox
 from . import clock, holiday_net, store, theme
 from .autostart import TRAY_FLAG
 from .main_window import MainWindow
-from .model import make_once
+from .model import make_log_entry
 from .popup import PopupManager
 from .scheduler import Scheduler
 
@@ -64,7 +64,8 @@ class App:
         self.root.withdraw()
         self.scheduler = Scheduler(self.items)
         self.popups = PopupManager(self.root, self.on_changed)
-        self.main_window = MainWindow(self.root, self.items, self.on_changed)
+        self.main_window = MainWindow(self.root, self.items, self.on_changed,
+                                      self.handle_now)
         self.tray = None
         self.running = True
         self.started = False        # 校时出结果后才开始判定，见 _after_clock
@@ -90,20 +91,28 @@ class App:
     def _log_fired(self, reminder) -> None:
         """循环提醒触发时，往便签本补一条「已完成」记录。
 
-        记录用 once 类型，直接标成已完成 —— 否则它的时间点已过，
-        会立刻被判定为「已错过」而标红，看起来像出了问题。
-
-        parent_id 记下是哪条循环刷的：列表里同一个来源的记录会收成一条可展开的
-        条目，免得一天十几条把便签本淹掉。
+        条目长什么样见 `model.make_log_entry` —— 手动「已处理」补的是同一个形，
+        所以那个函数两边共用。
         """
-        now = clock.now()
-        entry = make_once(reminder.text, now)
-        entry.parent_id = reminder.id
-        entry.acknowledge(now)          # 标完成并记下完成时刻
-        entry.last_fired_at = now
-        self.items.append(entry)
+        self.items.append(make_log_entry(reminder, clock.now()))
         store.save(self.items)
         self.main_window.refresh()
+
+    def handle_now(self, reminder, at) -> None:
+        """编辑框点了「已处理」：把这一格当已处理，从 at 重新起算。
+
+        排期重排已经在对话框里做完了（它得按表单里那些刚改过的字段算），这里
+        只收尾三件事：关掉这条循环正开着的那张弹窗（不关的话用户回头再点一下
+        它的「知道了」，会又推一格 —— 点两次推两次）、按「留记录」开关补一条
+        记录、落盘刷新。
+
+        「留记录」开关管这里：没勾就不补 —— 勾了的话**触发那一刻**已经补过一条，
+        处理时再补会让同一格出两条。
+        """
+        self.popups.close_for(reminder)
+        if reminder.log_to_list:
+            self.items.append(make_log_entry(reminder, at))
+        self.on_changed()
 
     def _tick(self) -> None:
         if not self.running:

@@ -5,7 +5,7 @@ import re
 import tkinter as tk
 from datetime import date, datetime, timedelta
 
-from . import frameless, holidays, prompt, theme
+from . import clock, frameless, holidays, prompt, theme
 from .geometry import center_on_parent
 from .model import (
     WEEKDAY_LABELS, make_daily, make_interval, make_once,
@@ -302,7 +302,7 @@ def _attach_normalize(entry: tk.Entry, normalizer) -> None:
     entry.bind("<FocusOut>", handler)
 
 
-def open_editor(parent, reminder=None, now=None):
+def open_editor(parent, reminder=None, now=None, on_handled=None):
     """打开编辑对话框。新建返回新 Reminder（未入列表），编辑就地改并返回，取消返回 None。
 
     外观上是「便签本上的一张单子」：跟主窗口同一套圆角纸，顶部那条色带就是
@@ -311,8 +311,22 @@ def open_editor(parent, reminder=None, now=None):
     高度**不写死**：三种类型的内容行数差很多（循环最多，光星期就一行），写死了
     不是底部留一大块空白、就是把「保存」挤出窗口。每次切类型重新量一遍，
     并且只改高度、不动左上角 —— 否则切一下窗口就跳一下。
+
+    `now` 有三种用法：
+      - 不传（None）—— 走真实时钟 clock.now()
+      - 传 datetime —— 恒定用它。既有测试全靠这个可复现
+      - 传可调用对象 —— 每次问它一次。用来测"保存基准是点保存那一刻"
+
+    `on_handled(reminder, at)` 是页脚「已处理」按钮收尾用的回调，由 App 提供
+    （关弹窗、按「留记录」开关补一条记录）。不传就只重排、不做那些收尾。
     """
-    now = now or datetime.now()
+    if callable(now):
+        _now = now
+    elif now is not None:
+        _now = lambda: now
+    else:
+        _now = clock.now
+    now = _now()                    # 打开对话框那一刻：表单默认值、快捷倒计时预设
     is_new = reminder is None
     base = reminder or make_once("", now)
 
@@ -497,11 +511,33 @@ def open_editor(parent, reminder=None, now=None):
     flabel(line_timing, "计时").pack(side="left", padx=(0, 8))
     timing_var = tk.StringVar(
         value=base.interval_mode if base.kind == "interval" else "fixed")
+
+    # 页脚那个「已处理」按钮该不该露脸。按钮要到页脚才建出来，所以先留个槽、
+    # 建好后塞进去（见页脚那段）。跟 sync_kind 一样用 lambda 包一层 ——
+    # command= 是建控件那一刻就绑定对象的，直接写 sync_handle 会绑到空函数上。
+    handle_slot: dict = {}
+
+    def sync_handle() -> None:
+        """只有"编辑一条已有的、按处理计时的循环"才给「已处理」。
+
+        新建时永不出现：新建本来就是"保存时刻 + 间隔"，没有"已处理的上一格"可记。
+        固定时刻的格子由时段起点决定、处理改变不了它，也不给（2026-10-15 spec §2）。
+        """
+        btn, cancel = handle_slot.get("btn"), handle_slot.get("cancel")
+        if btn is None:                 # 页脚还没建出来
+            return
+        if (not is_new and kind_var.get() == "interval"
+                and timing_var.get() == "rolling"):
+            btn.pack(side="left", padx=(0, 10), before=cancel)
+        else:
+            btn.pack_forget()
+
     tk.Radiobutton(line_timing, text="固定时刻", variable=timing_var,
-                   value="fixed", **theme.segment()).pack(side="left")
+                   value="fixed", command=lambda: sync_handle(),
+                   **theme.segment()).pack(side="left")
     tk.Radiobutton(line_timing, text="处理后计时", variable=timing_var,
-                   value="rolling", **theme.segment()).pack(side="left",
-                                                            padx=(6, 0))
+                   value="rolling", command=lambda: sync_handle(),
+                   **theme.segment()).pack(side="left", padx=(6, 0))
 
     line4 = tk.Frame(repeat_row, bg=theme.PAPER)
     line4.pack(anchor="w", pady=(10, 0))
@@ -553,10 +589,11 @@ def open_editor(parent, reminder=None, now=None):
             else:
                 date_label.grid()
                 date_entry.grid()
+        sync_handle()
         fit()
 
     def apply_countdown(minutes: int) -> None:
-        target = now + timedelta(minutes=minutes)
+        target = _now() + timedelta(minutes=minutes)
         kind_var.set("once")
         date_entry.delete(0, "end")
         date_entry.insert(0, target.strftime(DATE_FMT))
@@ -623,7 +660,13 @@ def open_editor(parent, reminder=None, now=None):
             return None
         return n
 
-    def on_ok() -> None:
+    def commit(at: datetime, mark_handled: bool = False) -> None:
+        """校验 + 落值 + 关窗。页脚「保存」和「已处理」共用这一条路径。
+
+        `at` 是"从现在起算"的基准时刻 —— 「保存」传点保存那一刻，「已处理」也传
+        点它那一刻。两者只差 `mark_handled`：为真时额外把这一格当已处理
+        （handled() 从 at 重新起算），并调 on_handled 让 App 收尾。
+        """
         text = text_box.get("1.0", "end").strip()
         if not text:
             warn("内容不能为空")
@@ -648,7 +691,7 @@ def open_editor(parent, reminder=None, now=None):
                 return
 
             if mode_var.get() == "date_range":
-                d1 = read_date(from_entry, now.date(), "开始日期")
+                d1 = read_date(from_entry, at.date(), "开始日期")
                 if d1 is None:
                     return
                 d2 = read_date(to_entry, d1 + timedelta(days=6), "结束日期")
@@ -657,7 +700,7 @@ def open_editor(parent, reminder=None, now=None):
                 if d2 < d1:
                     d1, d2 = d2, d1        # 起止填反了自动换回来，不弹提示
                 fresh = make_interval(text, [], start, end, step,
-                                      include_var.get(), now,
+                                      include_var.get(), at,
                                       repeat_mode="date_range",
                                       date_from=d1.isoformat(),
                                       date_to=d2.isoformat(),
@@ -667,7 +710,7 @@ def open_editor(parent, reminder=None, now=None):
                 # weekdays 传一~五 只是留个预设：workdays 模式的判定完全不看它，
                 # 但用户以后切回「按星期」时这排勾选框会预勾好
                 fresh = make_interval(text, [0, 1, 2, 3, 4], start, end, step,
-                                      include_var.get(), now,
+                                      include_var.get(), at,
                                       repeat_mode="workdays",
                                       log_to_list=log_var.get(),
                                       interval_mode=timing_var.get())
@@ -677,18 +720,18 @@ def open_editor(parent, reminder=None, now=None):
                     warn("请至少选择一天")
                     return
                 fresh = make_interval(text, days, start, end, step,
-                                      include_var.get(), now,
+                                      include_var.get(), at,
                                       log_to_list=log_var.get(),
                                       interval_mode=timing_var.get())
         elif kind == "daily":
-            now_hm = f"{now.hour:02d}:{now.minute:02d}"
+            now_hm = f"{at.hour:02d}:{at.minute:02d}"
             tod = read_time(time_entry, now_hm, "时间")
             if tod is None:
                 return
-            fresh = make_daily(text, tod, now)
+            fresh = make_daily(text, tod, at)
         else:
-            now_hm = f"{now.hour:02d}:{now.minute:02d}"
-            d = read_date(date_entry, now.date(), "日期")
+            now_hm = f"{at.hour:02d}:{at.minute:02d}"
+            d = read_date(date_entry, at.date(), "日期")
             if d is None:
                 return
             hm = read_time(time_entry, now_hm, "时间")
@@ -717,16 +760,34 @@ def open_editor(parent, reminder=None, now=None):
             if not keep_schedule:
                 base.last_fired_at = None
             base.enabled = True
+            if mark_handled:
+                # 这一格当已处理：从 at 重新起算（snooze 刚在上面清掉了）。
+                # 只有 rolling 会真的动 —— handled() 对 fixed 和别的类型是空操作。
+                base.handled(at)
             result.append(base)
         dlg.destroy()
+        if mark_handled and on_handled is not None:
+            on_handled(base, at)
+
+    def on_ok() -> None:
+        commit(_now())
 
     def on_cancel() -> None:
         dlg.destroy()
 
     btns = tk.Frame(body, bg=theme.PAPER)
     btns.pack(anchor="e", pady=(20, 0))
-    frameless.quiet_button(btns, "取消", on_cancel).pack(side="left")
-    frameless.primary_button(btns, "保存", on_ok).pack(side="left", padx=(10, 0))
+    cancel_btn = frameless.quiet_button(btns, "取消", on_cancel)
+    cancel_btn.pack(side="left")
+    save_btn = frameless.primary_button(btns, "保存", on_ok)
+    save_btn.pack(side="left", padx=(10, 0))
+    # 次级动作靠左、主动作靠右 —— 跟便签本底部条一个规矩。位置由 sync_handle
+    # 用 before=cancel_btn 定，所以这里建好不用立刻摆。
+    handle_btn = frameless.quiet_button(
+        btns, "已处理", lambda: commit(_now(), mark_handled=True))
+    handle_slot["btn"] = handle_btn
+    handle_slot["cancel"] = cancel_btn
+    sync_handle()
 
     first_fit = [True]
 

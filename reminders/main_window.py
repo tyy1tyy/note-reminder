@@ -172,10 +172,13 @@ def build_layout(items, now):
 
 
 class MainWindow:
-    def __init__(self, root: tk.Tk, items: list, on_changed):
+    def __init__(self, root: tk.Tk, items: list, on_changed, on_handled=None):
         self.root = root
         self.items = items
         self.on_changed = on_changed
+        # 编辑框「已处理」按钮的收尾回调（关弹窗 + 条件补记录 + 落盘）。
+        # 由 App 注入 —— 便签本这一层拿不到 PopupManager。默认 None 便于单测。
+        self.on_handled = on_handled
         self.win: tk.Toplevel | None = None
         self.tree: ttk.Treeview | None = None
         self.hint: tk.Label | None = None
@@ -724,7 +727,8 @@ class MainWindow:
         if len(items) > 1:
             prompt.notice(self.win, "一次只能编辑一条便签")
             return
-        result = edit_dialog.open_editor(self.win, reminder=items[0])
+        result = edit_dialog.open_editor(self.win, reminder=items[0],
+                                         on_handled=self.on_handled)
         if result is not None:
             self.on_changed()
             self.refresh()

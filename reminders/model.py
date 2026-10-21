@@ -463,6 +463,23 @@ def make_interval(text: str, weekdays, window_start: str, window_end: str,
     return r
 
 
+def make_log_entry(source: Reminder, now: datetime) -> Reminder:
+    """给 source 这条循环补一条"这一格处理过了"的记录。
+
+    触发时（`app._fire_popup` → `_log_fired`）和手动点「已处理」（编辑对话框）
+    补的都是它，所以**同形**：同文本、parent_id 指向源便签（列表里收成一个
+    可展开的组）、直接标完成。标完成是必须的 —— 记录条目的时间点已经过去，
+    不标就会被判定为「已错过」而标红，看起来像出了问题。
+
+    只造对象：不碰 source、不入列表、不落盘，那些由调用方（App）负责。
+    """
+    entry = make_once(source.text, now)
+    entry.parent_id = source.id
+    entry.acknowledge(now)          # 标完成并记下完成时刻
+    entry.last_fired_at = now
+    return entry
+
+
 # ---- 用户输入解析：宽进严出，别让用户操心格式 ----
 
 def parse_date_text(text: str) -> date | None:

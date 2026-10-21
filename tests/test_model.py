@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from reminders.model import (
     Reminder, make_once, make_countdown, make_daily, make_interval,
-    normalize_on_startup, fmt_dt, parse_dt,
+    make_log_entry, normalize_on_startup, fmt_dt, parse_dt,
     parse_date_text, parse_time_text,
     normalize_date_text, normalize_time_text,
 )
@@ -1034,6 +1034,41 @@ def test_old_data_without_done_at_loads():
                             "next_fire_at": "2026-09-15T09:00:00"})
     assert r.done is True
     assert r.done_at is None
+
+
+def test_make_log_entry_is_a_finished_once_shaped_like_fired_record():
+    """手动「已处理」和触发时补的那条记录必须同形 —— 只有时刻不同。
+
+    同形 = 同文本、同 parent_id（列表里收进同一个可展开的组）、标完成。
+    标完成是必须的：记录条目的时间点已过，不标就会被判「已错过」而标红。
+    """
+    src = make_interval("久坐提醒", list(range(7)), "00:00", "23:59", 60, True,
+                        datetime(2026, 9, 15, 9, 0), interval_mode="rolling")
+    at = datetime(2026, 9, 15, 10, 43)
+
+    entry = make_log_entry(src, at)
+
+    assert entry.kind == "once", entry.kind
+    assert entry.text == "久坐提醒", entry.text
+    assert entry.parent_id == src.id, entry.parent_id
+    assert entry.done is True, "记录条目该是已完成的，否则会立刻被标红"
+    assert entry.done_at == at, entry.done_at
+    assert entry.last_fired_at == at, entry.last_fired_at
+    assert entry.next_fire_at == at, entry.next_fire_at
+
+
+def test_make_log_entry_does_not_touch_the_source():
+    """补记录不能改动源循环 —— 重排是 handled() 的事，不是这里。"""
+    src = make_interval("久坐提醒", list(range(7)), "00:00", "23:59", 60, True,
+                        datetime(2026, 9, 15, 9, 0), interval_mode="rolling")
+    before_next, before_fired = src.next_fire_at, src.last_fired_at
+
+    make_log_entry(src, datetime(2026, 9, 15, 10, 43))
+
+    assert src.next_fire_at == before_next, src.next_fire_at
+    assert src.last_fired_at == before_fired, src.last_fired_at
+    assert src.parent_id == "", "源便签不该被挂上 parent_id"
+    assert src.done is False, "源便签不该被标完成"
 
 
 def _main():
